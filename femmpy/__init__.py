@@ -4,15 +4,19 @@ import re
 import matplotlib.pyplot as plt
 import matplotlib.collections as mc
 from scipy import interpolate
+from scipy.interpolate import interp1d
 from fuzzywuzzy import process  # for simple material fuzzy search
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import subprocess
 from subprocess import Popen, PIPE, STDOUT
 import random
+from collections import OrderedDict
+import networkx as nx
 
 param_name_rgx = re.compile(r"\[([A-Za-z0-9_]+)\]")  # get string between square brackets
 sub_param_name_rgx = re.compile(r"<(.*?)>")  # get string between < and >
+mu_0 = 4. * np.pi * 10**-7
 
 # material dictionary
 materials = {
@@ -253,8 +257,8 @@ class femm_file:
                         num = find_num(line)
                         idx = i
                         block_idx = 0
-                        sub = {}
-                        temp_dict = {}
+                        block_key = ""
+                        sub = OrderedDict()
                         while(block_idx < num):
                             line = lines[idx]
                             sub_params = sub_param_name_rgx.findall(line)
@@ -262,9 +266,19 @@ class femm_file:
                                 sub_param = sub_params[0]
                                 if sub_param == "EndBlock":
                                     block_idx += 1
-                                    sub[[*sub.keys()][-1]] = temp_dict
                                 elif sub_param == "BlockName":
+                                    block_key = find_string(line)[1:-1]
                                     sub[find_string(line)[1:-1]] = {}
+                                    sub[block_key]["BlockName"] = find_string(line)[1:-1]
+                                elif sub_param == "BeginBlock":
+                                    pass
+                                elif sub_param == "BHPoints":
+                                    rows = int(find_num(line))
+                                    elem_arr = np.array([[float(n) for n in lines[idx + j + 1].split('\t')] for j in range(rows)]).T
+                                    sub[block_key][sub_param] = elem_arr
+                                    idx += rows
+                                else:
+                                    sub[block_key][sub_param] = find_num(line)
                             idx += 1
                         blocks["BlockProps"] = sub
                     elif param == "CircuitProps":
@@ -294,7 +308,7 @@ class femm_file:
                         parsed_elem_data = []
                         for d in elem_data:
                             nums = d.split('\t')
-                            parsed_elem_data.append([float(n) for n in nums])
+                            parsed_elem_data.append([int(n) for n in nums])
                         # circuits
                         circuit_ind = elem_ind + 1 + elem_num
                         circuit_num = int(lines[circuit_ind])
@@ -315,30 +329,177 @@ class femm_file:
 
             Xi = np.linspace(Xmin, Xmax, N)  # grid of coordinates
             Yi = np.linspace(Ymin, Ymax, N)
-            dXi, dYi = [c[1] - c[0] for c in (Xi, Yi)]  # get spacing between uniform coordinates (it's a number not an array)
             xx, yy = np.meshgrid(Xi, Yi)     # grids of meshed coordinates
-            points = np.transpose(np.vstack((X, Y)))  # array of non uniform point coordinates
 
-            Ui = interpolate.griddata(points, U, (xx, yy), method='linear')  # grid of vectors
+            A = interpolate.griddata((X, Y), U, (xx, yy), method='linear')  # grid of vectors
 
-            Ux = interpolate.RegularGridInterpolator([Xi, Yi], Ui)  # function for vector U tip coordinate
+            Bx, By = np.gradient(A)
+            By = -By
+            B = np.linalg.norm(np.stack((Bx, By)), axis=0)
+            print(np.amax(B))
 
-            A = Ux((xx, yy))
-            Ax_grad, Ay_grad = np.gradient(A)
+            Bxf = interpolate.RegularGridInterpolator([Xi, Yi], Bx)
+            Byf = interpolate.RegularGridInterpolator([Xi, Yi], By)
 
-            Bv = np.transpose(np.array([Ay_grad, - Ax_grad]), axes=(0, 2, 1))
-            Bx, By = Bv
-            B = np.linalg.norm(Bv, axis=0)
+            # extract and interpolate BH curves
+            bh_curves_by_index = []
+            J_by_index = []
+            name_by_index = []
+            coords_by_index = []
+
+            # simple callable to generate bh curve approximated functions when bh points are not present
+            class func_generator():
+                def __init__(self, mu_r):
+                    self.mu = mu_r * mu_0
+
+                def __call__(self, B):
+                    return B / self.mu
+
+            for la in blocks["NumBlockLabels"]:
+                my_element = list(blocks["BlockProps"].items())[int(la[2] - 1)][1]
+                name_by_index.append(my_element["BlockName"])
+                my_bh_points = my_element["BHPoints"]
+                coords_by_index.append(la[0:2])
+                if(len(my_bh_points)):
+                    func = interp1d(my_bh_points[0], my_bh_points[1])
+                    bh_curves_by_index.append(func)
+                else:
+                    func = func_generator(my_element["Mu_x"])
+                    bh_curves_by_index.append(func)
+                J_by_index.append(my_element["J_re"])
+            # elems = np.array(blocks["Solution"][1], dtype=np.uint32)
+            # x_mu = (X[elems[:, 0]] + X[elems[:, 1]] + X[elems[:, 2]]) / 3.
+            # y_mu = (Y[elems[:, 0]] + Y[elems[:, 1]] + Y[elems[:, 2]]) / 3.
+            # Bc = np.array([Bxn(p)[0] for p in np.stack((x_mu, y_mu)).T])
+            # Hc = np.array([bh_curves_by_index[elem[3]](Bc[i]) for i, elem in enumerate(elems)])
+            # c_mu = Bc / Hc
+            # mu = interpolate.griddata((x_mu, y_mu), c_mu, (xx, yy), method='linear')
+
+            # Fx_by_object = np.array([0.]*len(bh_curves_by_index))
+            # Fy_by_object = np.array([0.]*len(bh_curves_by_index))
+
+            # F = np.linalg.norm(np.stack((Fx, Fy)), axis=0)
+            # plt.tricontourf(x_mu, y_mu, c_mu, 20)
+
+            # plt.contourf(Xi, Yi, np.linalg.norm(np.stack((Fx, Fy)), axis=0), 20)
+            # plt.show()
+
+            # find polygons
+            vertices = [v[0:2] for v in blocks["NumPoints"]]
+            segments = [s[0:2] for s in blocks["NumSegments"]]
+            g = nx.Graph()
+            for s in segments:
+                g.add_edge(s[0], s[1])
+            all_cycles = nx.recursive_simple_cycles(g.to_directed())
+            cycles = []
+            for c in all_cycles:
+                if len(c) > 2:
+                    cycles.append(c)
+            new_cycles = []
+            for c in cycles:
+                flag = True
+                for nc in new_cycles:
+                    temp_c = c.copy()
+                    temp_c.sort()
+                    temp_nc = nc.copy()
+                    temp_nc.sort()
+                    if temp_c == temp_nc:
+                        flag = False
+                        break
+                if flag:
+                    new_cycles.append(c)
+            cycles = new_cycles
+            polys = []
+            for c in cycles:
+                polys.append(Polygon([vertices[int(i)] for i in c]))
+                if not polys[-1].is_valid:
+                    RuntimeError("found invalid polygon while plotting")
+
+            # get polygon child list
+            poly_tree = {}
+            for i, p in enumerate(polys):
+                poly_tree[i] = []
+                for j, q in enumerate(polys):
+                    if i == j:
+                        continue
+                    elif p.contains(q):
+                        poly_tree[i].append(j)
+            print(poly_tree)
+
+            # integrate force
+            integration_steps_per_segment = 100
+
+            def middle_point(a, b, val):
+                return a + (b - a) * val
+
+            integration_path_points = []
+
+            def integrate(polygon):
+                coords = np.array(polygon.exterior.coords.xy).T
+                fx = 0
+                fy = 0
+                for a in range(len(coords) - 1):
+                    # iterate over each segment
+                    coordA = np.array(coords[a])
+                    coordB = np.array(coords[a + 1])
+                    dl = np.linalg.norm(coordA - coordB) / integration_steps_per_segment  # integration step along this segment
+                    angle = np.arctan2((coordB - coordA)[1], (coordB - coordA)[0])
+                    Nx = np.cos(angle)
+                    Ny = np.sin(angle)
+                    for i in range(integration_steps_per_segment):
+                        point = middle_point(coordA, coordB, i / integration_steps_per_segment)
+                        integration_path_points.append(point)
+                        Bxpoint = Bxf(point)
+                        Bypoint = Byf(point)
+                        Bpoint = 0.5 * (Bxpoint**2 + Bypoint**2)
+                        # maxwell stress tensor
+                        Txx = Bxpoint**2 - Bpoint
+                        Tyy = Bypoint**2 - Bpoint
+                        Txy = Bxpoint * Bypoint
+                        fx += (Txx * Nx + Txy * Ny) * dl
+                        fy += (Tyy * Ny + Txy * Nx) * dl
+                fx /= mu_0
+                fy /= mu_0
+                print(fx, fy)
+                return 0
+
+            Force = {}
+            computed_objs = []
+
+            while len(Force) < len(polys):
+                for key in poly_tree:
+                    # check if every contained object has been computed
+                    everything_computed = True
+                    for obj in poly_tree[key]:
+                        if obj not in computed_objs:
+                            everything_computed = False
+                    if everything_computed:
+                        f = integrate(polys[key])
+                        for obj_key in poly_tree[key]:
+                            f -= Force[obj_key]
+                        Force[key] = f
+                        computed_objs.append(key)
+
+            val = 10
+            integration_path_points = np.array(integration_path_points).T
+            plt.quiver(Xi[::val], Yi[::val], Bx[::val, ::val], By[::val, ::val])
+            plt.scatter(integration_path_points[0], integration_path_points[1])
+            plt.show()
+
             Bmax = np.amax(B)
             Bmin = np.amin(B)
             nBmax = Bmax + ((Bmax - Bmin) * 0)
             nBmin = Bmin - ((Bmax - Bmin) * 0.23)
-            Bxs, Bys = (B > Bmax * 0.1) * Bv
+            # Bxs, Bys = (B > Bmax * 0.1) * Bv
 
             fig, ax = plt.subplots()
             # plt.imshow(B, cmap='jet': """""", interpolation='none')
-            ax.contourf(Xi, Yi, B, 20, vmin=nBmin, vmax=nBmax, cmap='gist_ncar')
-            ax.streamplot(Xi, Yi, Bxs, Bys, density=1.5, arrowstyle='->', maxlength=1000, linewidth=0.5, color='black', arrowsize=1)  # noqa
+            plt.rcParams['contour.negative_linestyle'] = 'solid'
+            plt.rcParams["contour.linewidth"] = 0.5
+            plot = ax.contourf(Xi, Yi, B, 20, vmin=nBmin, vmax=nBmax, cmap='gist_ncar')
+            fig.colorbar(plot)
+            ax.contour(Xi, Yi, A, 15, colors='k')
+            # ax.streamplot(Xi, Yi, Bxs, Bys, density=1.5, arrowstyle='->', maxlength=1000, linewidth=0.5, color='black', arrowsize=1)  # noqa
             # plt.quiver(xx, yy, Bx, By)
 
             # ##### plot geometry
@@ -353,5 +514,5 @@ class femm_file:
             ax.add_collection(lc)
 
             plt.gca().set_aspect('equal')
-            plt.savefig(output_path)
+            plt.savefig(output_path, dpi=400)
             return output_path
