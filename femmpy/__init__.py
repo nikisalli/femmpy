@@ -13,6 +13,7 @@ from subprocess import Popen, PIPE, STDOUT
 import random
 from collections import OrderedDict
 import networkx as nx
+from vtk.util import numpy_support
 
 param_name_rgx = re.compile(r"\[([A-Za-z0-9_]+)\]")  # get string between square brackets
 sub_param_name_rgx = re.compile(r"<(.*?)>")  # get string between < and >
@@ -323,6 +324,69 @@ class femm_file:
             nodes = np.array(blocks["Solution"][0])
             X, Y, U, V = nodes[:, 0], nodes[:, 1], nodes[:, 2], nodes[:, 3]
 
+            # ##### element wise gradient of the vector magnetic field
+            # get edge neighbor list
+            eg = nx.Graph()
+            for e in blocks["Solution"][1]:
+                eg.add_edge(e[0], e[1])
+                eg.add_edge(e[1], e[2])
+                eg.add_edge(e[0], e[2])
+            node_neighbors = [[i for i in eg.neighbors(j)] for j in range(len(blocks["Solution"][0]))]
+            # circular sort the neighbors of each node
+            for i in range(len(blocks["Solution"][0])):
+                temp = [node_neighbors[i][0]]  # append a start node
+                while(len(temp) < len(node_neighbors[i])):
+                    for elem in node_neighbors[i]:
+                        neighs = eg.neighbors(elem)
+                        for n in neighs:
+                            if n in node_neighbors[i] and n not in temp:
+                                temp.insert(0, n)
+                                break
+                node_neighbors[i] = temp
+            # evaluate the partial derivative for each node
+            Gx = []
+            Gy = []
+            for i in range(len(blocks["Solution"][0])):
+                neighs = node_neighbors[i]
+                area = 0
+                Gx.append(0)
+                Gy.append(0)
+                for neigh in range(len(neighs)):
+                    j = neighs[neigh]
+                    jL = neighs[neigh-1]
+                    jR = neighs[(neigh+1) % len(neighs)]
+                    jc = np.array([blocks["Solution"][0][j][0], blocks["Solution"][0][j][1]])
+                    ic = np.array([blocks["Solution"][0][i][0], blocks["Solution"][0][i][1]])
+                    cL = np.array([(blocks["Solution"][0][j][0] + blocks["Solution"][0][jL][0] + blocks["Solution"][0][i][0]) / 3,
+                                   (blocks["Solution"][0][j][1] + blocks["Solution"][0][jL][1] + blocks["Solution"][0][i][1]) / 3])
+                    cR = np.array([(blocks["Solution"][0][j][0] + blocks["Solution"][0][jR][0] + blocks["Solution"][0][i][0]) / 3,
+                                   (blocks["Solution"][0][j][1] + blocks["Solution"][0][jR][1] + blocks["Solution"][0][i][1]) / 3])
+                    m = np.array([(blocks["Solution"][0][j][0] + blocks["Solution"][0][i][0]) / 2,
+                                  (blocks["Solution"][0][j][1] + blocks["Solution"][0][i][1]) / 2])
+                    nL = np.array([cL[1] - m[1], m[0] - cL[0]])
+                    nL /= np.linalg.norm(nL)
+                    nR = np.array([m[1] - cR[1], cR[0] - m[0]])
+                    nR /= np.linalg.norm(nR)
+                    lL = np.linalg.norm(cL - m)
+                    lR = np.linalg.norm(cR - m)
+                    Um = (blocks["Solution"][0][j][2] + blocks["Solution"][0][i][2]) / 2
+                    l_mi = np.linalg.norm(jc - ic) / 2
+                    l_cLi = np.linalg.norm(ic - cL)
+                    l_cRi = np.linalg.norm(ic - cR)
+                    normal = lL * nL + lR * nR
+                    s1 = (l_mi + l_cLi + lL) / 2
+                    s2 = (l_mi + l_cRi + lR) / 2
+                    area += (s1 * (s1 - l_mi) * (s1 - l_cLi) * (s1 - lL) * 0.5) + (s2 * (s2 - l_mi) * (s2 - l_cRi) * (s2 - lR) * 0.5)
+                    Gx[i] = Gx[i] + Um * normal[0]
+                    Gy[i] = Gy[i] + Um * normal[1]
+                Gx[i] = Gx[i] / area
+                Gy[i] = Gy[i] / area
+
+            B = np.linalg.norm(np.stack((Gx, Gy)), axis=0)
+            print(np.amax(B), np.mean(B), np.amin(B))
+            plt.tricontourf(X, Y, np.clip(B, 0, 0.5), 50)
+            plt.show()
+
             N = 100  # grid dimension
 
             Xmax, Xmin, Ymax, Ymin = max(X), min(X), max(Y), min(Y)
@@ -336,53 +400,11 @@ class femm_file:
             Bx, By = np.gradient(A)
             By = -By
             B = np.linalg.norm(np.stack((Bx, By)), axis=0)
-            print(np.amax(B))
+            print(np.amax(B), np.mean(B), np.amin(B))
 
             Bxf = interpolate.RegularGridInterpolator([Xi, Yi], Bx)
             Byf = interpolate.RegularGridInterpolator([Xi, Yi], By)
-
-            # extract and interpolate BH curves
-            bh_curves_by_index = []
-            J_by_index = []
-            name_by_index = []
-            coords_by_index = []
-
-            # simple callable to generate bh curve approximated functions when bh points are not present
-            class func_generator():
-                def __init__(self, mu_r):
-                    self.mu = mu_r * mu_0
-
-                def __call__(self, B):
-                    return B / self.mu
-
-            for la in blocks["NumBlockLabels"]:
-                my_element = list(blocks["BlockProps"].items())[int(la[2] - 1)][1]
-                name_by_index.append(my_element["BlockName"])
-                my_bh_points = my_element["BHPoints"]
-                coords_by_index.append(la[0:2])
-                if(len(my_bh_points)):
-                    func = interp1d(my_bh_points[0], my_bh_points[1])
-                    bh_curves_by_index.append(func)
-                else:
-                    func = func_generator(my_element["Mu_x"])
-                    bh_curves_by_index.append(func)
-                J_by_index.append(my_element["J_re"])
-            # elems = np.array(blocks["Solution"][1], dtype=np.uint32)
-            # x_mu = (X[elems[:, 0]] + X[elems[:, 1]] + X[elems[:, 2]]) / 3.
-            # y_mu = (Y[elems[:, 0]] + Y[elems[:, 1]] + Y[elems[:, 2]]) / 3.
-            # Bc = np.array([Bxn(p)[0] for p in np.stack((x_mu, y_mu)).T])
-            # Hc = np.array([bh_curves_by_index[elem[3]](Bc[i]) for i, elem in enumerate(elems)])
-            # c_mu = Bc / Hc
-            # mu = interpolate.griddata((x_mu, y_mu), c_mu, (xx, yy), method='linear')
-
-            # Fx_by_object = np.array([0.]*len(bh_curves_by_index))
-            # Fy_by_object = np.array([0.]*len(bh_curves_by_index))
-
-            # F = np.linalg.norm(np.stack((Fx, Fy)), axis=0)
-            # plt.tricontourf(x_mu, y_mu, c_mu, 20)
-
-            # plt.contourf(Xi, Yi, np.linalg.norm(np.stack((Fx, Fy)), axis=0), 20)
-            # plt.show()
+            print(Bxf((1.5, 0.5)), Byf((1.5, 0.5)))
 
             # find polygons
             vertices = [v[0:2] for v in blocks["NumPoints"]]
@@ -482,9 +504,9 @@ class femm_file:
 
             val = 10
             integration_path_points = np.array(integration_path_points).T
-            plt.quiver(Xi[::val], Yi[::val], Bx[::val, ::val], By[::val, ::val])
-            plt.scatter(integration_path_points[0], integration_path_points[1])
-            plt.show()
+            # plt.quiver(Xi[::val], Yi[::val], Bx[::val, ::val], By[::val, ::val])
+            # plt.scatter(integration_path_points[0], integration_path_points[1])
+            # plt.show()
 
             Bmax = np.amax(B)
             Bmin = np.amin(B)
